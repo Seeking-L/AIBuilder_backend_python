@@ -13,8 +13,8 @@ def get_system_prompt(
 
     关键点：
     - 你运行在后端，有写文件 / 跑命令的能力；
-    - 只能在本任务的 workspace_root 内操作；
-    - Expo 应用以 expo_root（拷贝自 BaseCodeForAI/baseExpo）为唯一开发根；
+    - 只能在本任务的 workspace_root 内操作（通常为 AIBuilder_workspace/generated/<task-id>）；
+    - Expo 应用以 expo_root（拷贝自 BaseCodeForAI/baseExpo）为唯一开发根，且每个任务都有自己的 generated/<task-id>/baseExpo 目录；
     - 只能在允许的子目录下增量开发，不得修改配置文件或脚手架脚本；
     - 在 expo_root 下先执行 `npm ci`，再执行 `npm start` 或 `npx expo start --tunnel` 启动开发服务器。
     """
@@ -36,13 +36,14 @@ def get_system_prompt(
             task_line,
             "",
             "Global rules:",
-            "- Only write files inside the workspace root for this task.",
+            "- Only write files inside the workspace root for this task (for example, a per-task directory like `AIBuilder_workspace/generated/<task-id>`).",
             "- Prefer npm scripts like `npm test`, `npm run build`, or `npm start` over raw commands when appropriate.",
             "- Keep changes minimal and focused on the user's request.",
             "- When you need to run a command or write a file, always use the provided tools.",
             "",
             "Expo-specific rules (BaseCodeForAI/baseExpo template):",
-            "- Treat the Expo app root as a fixed template project copied from `BaseCodeForAI/baseExpo`.",
+            "- There is a shared Expo template in the backend repo at `BaseCodeForAI/baseExpo`. This template is READ-ONLY; you must never modify files there.",
+            "- Treat the Expo app root for this task as a project copied from that template into `generated/<task-id>/baseExpo` under the workspace root.",
             "- Only create or modify files under the Expo app root in these subdirectories:",
             "  - `app/`",
             "  - `components/common/`",
@@ -69,12 +70,20 @@ def get_system_prompt(
             "",
             "Tool usage rules for Expo (very important):",
             "- When you need to install Node dependencies for the Expo app, call the `execute_command` tool with:",
-            "  - `command: \"npm ci\"`",
+            "  - `command: \"npm ci\"`.",
             "  - `cwd` set to the Expo app root.",
-            "- When you need to start the Expo development server, call `execute_command` with:",
-            "  - `command: \"npm start\"` or `\"npx expo start --tunnel\"`",
-            "  - `cwd` set to the Expo app root.",
-            "- The Expo dev server is a long-running process; it's acceptable if the command does not exit quickly.",
+            "  - Do this at most once per task; before running `npm ci` again in the same task, check prior command outputs to confirm it has not already succeeded.",
+            "- When you need to start the Expo development server:",
+            "  - First call the `get_available_port` tool to obtain a free TCP port (this avoids collisions like 8080/8081 already being in use).",
+            "  - Prefer reusing an existing dev server within the same task instead of starting a second one. Before starting a new dev server, inspect earlier tool outputs to see whether Metro is already running and which port it is using.",
+            "  - Start the dev server by calling `execute_command` with:",
+            "    - `command: \"npx expo start --port <port>\"` where `<port>` is the number returned by `get_available_port` (for example: `\"npx expo start --port 9234\"`).",
+            "    - `cwd` set to the Expo app root.",
+            "    - `longRunning` set to `true` so that the command is treated as a long-lived dev server and is not killed by timeouts.",
+            "    - Do NOT set `timeoutSeconds` when `longRunning` is true.",
+            "- Avoid using `--tunnel` by default. This environment is non-interactive and `npx expo start --tunnel` may fail if the tunnel provider (such as ngrok) cannot connect or requires input.",
+            "- Only use `--tunnel` if the user explicitly requests an external tunnel and you have already tried a direct `localhost` URL. If a tunnel command fails with errors like `ngrok tunnel took too long to connect`, fall back to a plain `npx expo start --port <port>` without `--tunnel`.",
+            "- The Expo dev server is a long-running process; it is expected to keep running and streaming logs. It is normal for the command not to exit quickly when `longRunning` is true.",
             "- In your natural language responses, extract the key URLs from the command output, for example:",
             "  - The `exp://...` link for Expo Go.",
             "  - Any `http://localhost:...` web URL.",
@@ -82,11 +91,14 @@ def get_system_prompt(
             '  - `{ \"expoUrl\": \"exp://...\", \"webUrl\": \"http://localhost:19006\" }`.',
             "",
             "File path conventions when using tools:",
-            "- When you use the `write_to_file` tool for Expo-related code, use absolute or workspace-relative paths that point into the Expo app root, such as:",
-            "  - `<expo_root>/app/profile/index.tsx`",
-            "  - `<expo_root>/services/user.ts`",
-            "  - `<expo_root>/types/user.ts`.",
-            "- Do not create new top-level projects; always extend the existing Expo app under the provided Expo app root.",
+            "- The workspace root for this task is a per-task directory such as `AIBuilder_workspace/generated/<task-id>`. The Expo app root lives under that directory as `baseExpo`.",
+            "- When you use the `write_to_file` tool for Expo-related code, prefer workspace-relative paths that point into the per-task Expo app root, such as:",
+            "  - `baseExpo/app/profile/index.tsx`",
+            "  - `baseExpo/services/user.ts`",
+            "  - `baseExpo/types/user.ts`.",
+            "- If you refer to the Expo app root using an absolute path (for example `<expo_root>/app/...`), `<expo_root>` must always point inside `generated/<task-id>/baseExpo` for the current task.",
+            "- Never use paths that start with `BaseCodeForAI/baseExpo` or point to `AIBuilder_workspace/baseExpo`; those locations are shared templates and must be treated as read-only.",
+            "- Do not create new top-level projects; always extend the existing Expo app under the provided Expo app root for this task.",
         ]
     )
 

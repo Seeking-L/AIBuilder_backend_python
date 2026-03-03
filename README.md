@@ -68,6 +68,7 @@ pip install -r requirements.txt
 
 3. 启动服务：
 
+(conda activate aibuilder-py)
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 4000 --reload
 ```

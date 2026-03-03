@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+from logging.handlers import RotatingFileHandler
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,7 +11,35 @@ from config import settings
 from routers.tasks import router as tasks_router
 
 
+def _setup_progress_logging() -> None:
+    """配置 agent.progress logger，将 AI 工作与命令执行进度写入日志文件。"""
+    logger = logging.getLogger("agent.progress")
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        log_path = settings.progress_log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
+
+    # 不向上冒泡，避免重复输出到其它 handler
+    logger.propagate = False
+
+
 def create_app() -> FastAPI:
+    _setup_progress_logging()
+
     # 创建 FastAPI 应用实例，title 主要用于文档页面展示
     app = FastAPI(title="AIBuilder Python Backend")
 

@@ -38,6 +38,8 @@ def _require_env(name: str, fallback: str | None = None) -> str:
 class Settings:
     port: int
     workspace_root: Path
+    # agent.progress 日志文件路径（绝对路径）
+    progress_log_path: Path
     model_provider: str
     model_name: str
     openai_api_key: str | None
@@ -64,9 +66,22 @@ def _resolve_workspace_root() -> Path:
     return (BASE_DIR.parent / "AIBuilder_workspace").resolve()
 
 
+def _resolve_progress_log_path() -> Path:
+    """进度日志文件路径：优先 PROGRESS_LOG_PATH，否则为项目根目录 logs/agent-progress.log。"""
+    log_path_env = os.getenv("PROGRESS_LOG_PATH")
+    base_root = BASE_DIR.parent
+    if log_path_env:
+        p = Path(log_path_env).expanduser()
+        if not p.is_absolute():
+            p = (base_root / p).resolve()
+        return p
+    return (base_root / "logs" / "agent-progress.log").resolve()
+
+
 settings = Settings(
     port=int(os.getenv("PORT", "4000")),
     workspace_root=_resolve_workspace_root(),
+    progress_log_path=_resolve_progress_log_path(),
     model_provider=os.getenv("MODEL_PROVIDER", "openai"),
     model_name=_require_env("MODEL_NAME", "gpt-4.1"),
     openai_api_key=os.getenv("OPENAI_API_KEY"),

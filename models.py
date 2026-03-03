@@ -10,6 +10,33 @@ class GenerateAppRequest(BaseModel):
     framework: Optional[str] = "expo"
 
 
+class AgentEvent(BaseModel):
+    """前端展示用的 Agent 过程事件。"""
+
+    stepId: int
+    type: Literal[
+        "round_start",
+        "llm_response",
+        "tool_call",
+        "tool_result",
+        "finished",
+        "command_start",
+        "command_output",
+        "command_end",
+    ]
+    title: str
+    detail: Optional[str] = None
+
+
+class StartGenerateAppResponse(BaseModel):
+    """异步生成应用：任务已接受时的返回结构。"""
+
+    status: Literal["accepted"]
+    taskId: str
+    # 本次生成的 Expo 根目录（便于前端在任务未完成前就知道路径）
+    expoRoot: str
+
+
 class GenerateAppResponse(BaseModel):
     status: Literal["completed"]
     description: str
@@ -25,4 +52,6 @@ class GenerateAppResponse(BaseModel):
     expoRoot: str
     # 尝试从执行日志中提取到的 Expo URL（如 exp://... 或 http://localhost:...），前端可据此生成二维码。
     expoUrl: Optional[str] = None
+    # 结构化的过程事件列表，前端可按时间线展示 AI 的工作过程。
+    events: List[AgentEvent] = Field(default_factory=list)
 
