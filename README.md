@@ -106,3 +106,34 @@ curl -X POST http://localhost:4000/tasks/generate-app ^
 }
 ```
 
+### 多窗口对话验证（端到端）
+
+说明：对话窗口/多轮聊天使用匿名 `session_id` cookie 隔离，不需要登录态。
+
+1. 创建两个窗口（conversation A/B）
+   - 调用 `POST /conversations` 两次，分别获得 `conversationIdA`、`conversationIdB`
+   - 前端/浏览器会自动保存 cookie；如果用命令行，请确保携带同一个 cookie。
+
+2. 在窗口 A 发送第一条消息并实时订阅
+   - `POST /conversations/{conversationIdA}/messages`，请求体：`{"text":"你的第一个需求"}`（可选携带 framework）
+   - 得到 `runIdA`
+   - 连接 `WebSocket /conversations/ws/{conversationIdA}/{runIdA}`，观察：
+     - 实时收到 `AgentEvent(stepId/type/title/detail)`（直到有 tool / 命令输出）
+     - run 结束后收到一条 `{"type":"task_status","status":"completed"|"failed","error":...}`，随后连接关闭
+
+3. 切换到窗口 B 重复上述流程
+   - 确认 A 与 B 的时间线与工程修改互不干扰。
+
+4. 同一窗口追加多条消息（验证工程复用）
+   - 继续对 `conversationIdA` 调用 `POST /conversations/{conversationIdA}/messages`
+   - 在观察到更多 `write_to_file/execute_command` 修改后，确认修改发生在同一个目录：
+     - `generated/<conversationIdA>/baseExpo`（不应反复拷贝模板/清空目录）
+
+5. 刷新页面（验证窗口列表与历史持久化）
+   - 刷新后调用 `GET /conversations`：应能看到之前创建的 A/B
+   - 调用 `GET /conversations/{conversationIdA}/messages`：应能看到完整历史（包含用户与 AI 回复、tool 结果）
+
+6. 断线重连（验证 lastStepId 增量补发）
+   - 在 WebSocket 连接过程中主动断开
+   - 重新连接时使用 `?lastStepId=<最后收到的stepId>`：应只补齐缺失 events，且不重复已收到的 events。
+

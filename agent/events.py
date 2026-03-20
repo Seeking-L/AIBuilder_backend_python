@@ -18,6 +18,9 @@ class AgentEvent:
         "command_start",
         "command_output",
         "command_end",
+        # 当模型通过 `notify_expo_url_ready` tool 成功通知后端时发出：
+        # 前端可展示“查看应用”按钮，并根据 detail 中的 exp://... 打开 Expo Go。
+        "expo_url_ready",
     ]
     title: str
     detail: Optional[str] = None

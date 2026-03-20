@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
 
 from openai import OpenAI
 
@@ -216,6 +216,47 @@ def _extract_expo_url(text: str) -> Optional[str]:
     return None
 
 
+def _build_task_initial_user_content(
+    *,
+    description: str,
+    framework: Optional[str],
+    task_id: Optional[str],
+    workspace_root: Path,
+    expo_root: Optional[str],
+) -> str:
+    """构造“一次性任务”run 的第一条 user 消息内容。
+
+    说明：
+    - run_task_loop 目前只支持一次性 description 驱动，因此首条 user 消息会附带较多“开发约束文本”。
+    - conversation 模式会复用系统 prompt + messages 历史，不再依赖这段 user content 里的长约束文本（后续可按需要调整）。
+    """
+
+    effective_expo_root = expo_root or "(not provided)"
+    return "\n".join(
+        [
+            f"User request: {description}",
+            f"Preferred framework: {framework or 'expo'}",
+            f"Task id: {task_id or 'N/A'}",
+            f"Workspace root for this task: {workspace_root}",
+            f"Expo app root for this task: {effective_expo_root}",
+            "",
+            "Development constraints for this task:",
+            "- You must treat the Expo app root for this task as a project copied from the shared template at BaseCodeForAI/baseExpo into generated/<task-id>/baseExpo under the workspace root.",
+            "- All modifications for this task must stay under this per-task Expo app root; do not modify any shared baseExpo directories such as AIBuilder_workspace/baseExpo or BaseCodeForAI/baseExpo.",
+            "- Only create or modify files under the Expo app root in these subdirectories: app/, components/common/, hooks/, services/, types/.",
+            "- Do NOT modify configuration or tooling files such as package.json, tsconfig.json, ESLint configs, or scripts (e.g. scripts/reset-project.js).",
+            "- Use Expo Router file-based routing for pages (e.g. app/profile/index.tsx, app/posts/[id].tsx).",
+            "- Use ScreenContainer, AppText, PrimaryButton, and Spacer from components/common for layout and UI where appropriate.",
+            "- Put network and data access logic into modules under services/; screens should not call fetch directly.",
+            "- Before running the Expo dev server, run `npm ci` in the Expo app root to install dependencies.",
+            "- Start the Expo dev server with `npm start` or `npx expo start --tunnel` using cwd set to the Expo app root.",
+            "",
+            "When planning your work, first outline which files you intend to add or modify (with paths relative to the Expo app root, e.g. app/... under baseExpo for this task),",
+            "then use the available tools to actually write files and run commands.",
+        ]
+    )
+
+
 def run_task_loop(input: TaskInput) -> TaskResult:
     """多轮「LLM 回复 + 工具执行」任务循环，参考 TS 版本的 runTaskLoop。
 
@@ -261,28 +302,12 @@ def run_task_loop(input: TaskInput) -> TaskResult:
         messages: List[ChatMessage] = [
             {
                 "role": "user",
-                "content": "\n".join(
-                    [
-                        f"User request: {input.description}",
-                        f"Preferred framework: {input.framework or 'expo'}",
-                        f"Task id: {input.task_id or 'N/A'}",
-                        f"Workspace root for this task: {effective_workspace_root}",
-                        f"Expo app root for this task: {input.expo_root or '(not provided)'}",
-                        "",
-                        "Development constraints for this task:",
-                        "- You must treat the Expo app root for this task as a project copied from the shared template at BaseCodeForAI/baseExpo into generated/<task-id>/baseExpo under the workspace root.",
-                        "- All modifications for this task must stay under this per-task Expo app root; do not modify any shared baseExpo directories such as AIBuilder_workspace/baseExpo or BaseCodeForAI/baseExpo.",
-                        "- Only create or modify files under the Expo app root in these subdirectories: app/, components/common/, hooks/, services/, types/.",
-                        "- Do NOT modify configuration or tooling files such as package.json, tsconfig.json, ESLint configs, or scripts (e.g. scripts/reset-project.js).",
-                        "- Use Expo Router file-based routing for pages (e.g. app/profile/index.tsx, app/posts/[id].tsx).",
-                        "- Use ScreenContainer, AppText, PrimaryButton, and Spacer from components/common for layout and UI where appropriate.",
-                        "- Put network and data access logic into modules under services/; screens should not call fetch directly.",
-                        "- Before running the Expo dev server, run `npm ci` in the Expo app root to install dependencies.",
-                        "- Start the Expo dev server with `npm start` or `npx expo start --tunnel` using cwd set to the Expo app root.",
-                        "",
-                        "When planning your work, first outline which files you intend to add or modify (with paths relative to the Expo app root, e.g. app/... under baseExpo for this task),",
-                        "then use the available tools to actually write files and run commands.",
-                    ]
+                "content": _build_task_initial_user_content(
+                    description=input.description,
+                    framework=input.framework,
+                    task_id=input.task_id,
+                    workspace_root=effective_workspace_root,
+                    expo_root=input.expo_root,
                 ),
             }
         ]
@@ -435,7 +460,44 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                                 failed=(exit_code != 0),
                             )
 
-                    execute_command_hooks = (_on_start, _on_output, _on_end)
+                    def _on_command_input_request(prompt_text: str) -> str:
+                        """当子进程请求 stdin 输入时，调用 LLM 自动生成最小输入内容。
+
+                        该回调会被 `agent/tools.py` 在“子进程输出线程”中触发，因此：
+                        - 不修改 messages/main loop；
+                        - 禁用 tools（避免模型再触发 execute_command 等递归调用）；
+                        - 要求模型只输出可直接写入 stdin 的内容（无解释）。
+                        """
+                        input_system_prompt = (
+                            "You are an automated stdin responder for interactive CLI prompts.\n"
+                            "You will receive a detected prompt text from a running process.\n\n"
+                            "Rules (VERY IMPORTANT):\n"
+                            "- Output ONLY the exact input the user should type, with no explanation.\n"
+                            "- For yes/no prompts: output only a single character: 'y' or 'n'.\n"
+                            "- For port-replacement prompts: default to 'y'.\n"
+                            "- For Expo 'Press <key>' prompts: output exactly one key character from the candidate list.\n"
+                            "- If multiple candidates exist and 'w' exists, prefer 'w' (open web). Otherwise choose the first candidate.\n"
+                            "- Output must be a single line.\n"
+                        )
+                        try:
+                            # 禁用工具调用，避免模型递归触发 execute_command。
+                            _assistant_text, _tool_calls = api.create_message(
+                                system_prompt=input_system_prompt,
+                                messages=[{"role": "user", "content": prompt_text}],
+                                tools=[],
+                            )
+                            # 工具层会根据 kind 做进一步 sanitize/兜底。
+                            return (_assistant_text or "").strip()
+                        except Exception:
+                            # 回调失败时返回空字符串，让工具层兜底策略接管。
+                            return ""
+
+                    execute_command_hooks = (
+                        _on_start,
+                        _on_output,
+                        _on_end,
+                        _on_command_input_request,
+                    )
 
                 try:
                     result = run_tool_call(
@@ -514,6 +576,317 @@ def run_task_loop(input: TaskInput) -> TaskResult:
         )
     finally:
         # 确保无论任务是否成功完成，都重置 workspace_root 上下文，避免影响其它任务。
+        if workspace_token is not None:
+            reset_task_workspace_root(workspace_token)
+
+
+def run_conversation_turn(
+    *,
+    run_id: str,
+    workspace_root_override: str,
+    expo_root: str,
+    existing_messages: List[ChatMessage],
+    event_sink: Callable[[AgentEvent], None],
+    persist_message: Callable[[str, str, Optional[str], Optional[List[ToolCall]]], None],
+) -> TaskResult:
+    """conversation 模式：一次用户消息对应一次 run。
+
+    输入：
+    - existing_messages：已包含“本次用户消息”在内的完整对话上下文（已按 OpenAI chat 格式保存）。
+    - event_sink：把每个 AgentEvent 立即写入持久化存储（满足刷新后时间线）。
+    - persist_message：把 run 过程中新增的 assistant/tool 消息写入持久化存储（供下次续聊构造上下文）。
+    """
+
+    api = ApiHandler()
+
+    effective_workspace_root = Path(workspace_root_override).expanduser().resolve()
+    workspace_token: object | None = None
+    try:
+        workspace_token = set_task_workspace_root(effective_workspace_root)
+
+        system_prompt = get_system_prompt(
+            workspace_root=effective_workspace_root,
+            expo_root=Path(expo_root).resolve(),
+            task_id=run_id,
+        )
+
+        logs: List[str] = []
+        events: List[AgentEvent] = []
+        step_id = 1
+
+        # 用于“AI 生成结束后通知前端查看应用”的贯通逻辑：
+        # - 当模型调用 `notify_expo_url_ready` tool 时，后端把 exp://... 转成前端可见事件
+        # - 同一次 run 里只通知一次（避免重复按钮/多次跳转）
+        expo_url_ready: Optional[str] = None
+        expo_url_ready_notified = False
+
+        # 注意：existing_messages 必须包含本次 user 输入；run 不会再创建新的 user 消息。
+        messages: List[ChatMessage] = list(existing_messages)
+
+        final_text = ""
+
+        for round_index in range(settings.max_task_rounds):
+            round_number = round_index + 1
+            logs.append(f"--- Round {round_number} ---")
+            round_event = AgentEvent(
+                step_id=step_id,
+                type="round_start",
+                title=f"开始第 {round_number} 轮对话",
+                detail=None,
+            )
+            events.append(round_event)
+            event_sink(round_event)
+            step_id += 1
+
+            assistant_text, tool_calls = api.create_message(
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tool_definitions,
+            )
+
+            logs.append(f"Assistant:\n{assistant_text}")
+            llm_event = AgentEvent(
+                step_id=step_id,
+                type="llm_response",
+                title=f"模型回复（第 {round_number} 轮）",
+                detail=assistant_text[:400],
+            )
+            events.append(llm_event)
+            event_sink(llm_event)
+            step_id += 1
+
+            if not tool_calls:
+                final_text = assistant_text
+
+                # 关键：conversation 模式需要持久化最终 assistant 消息（无 tool_calls）。
+                # 否则刷新后聊天记录会缺少最后一条 AI 回复，且后续续聊缺少上下文。
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_text,
+                    }
+                )
+                persist_message("assistant", assistant_text, None, None)
+
+                finished_event = AgentEvent(
+                    step_id=step_id,
+                    type="finished",
+                    title="任务已完成（未再请求工具）",
+                    detail=final_text[:400],
+                )
+                events.append(finished_event)
+                event_sink(finished_event)
+                step_id += 1
+                break
+
+            tool_results: List[str] = []
+            for tool_call in tool_calls:
+                tool_name = tool_call["function"]["name"]
+                # 只有 notify_expo_url_ready 这个 tool 才需要解析 expoUrl 参数；
+                # 其它工具保持 None，避免无谓的解析和潜在异常。
+                expo_url_candidate: Optional[str] = None
+                if tool_name == "notify_expo_url_ready":
+                    arguments_json = tool_call["function"].get("arguments") or "{}"
+                    try:
+                        arguments_obj = json.loads(arguments_json)
+                    except (json.JSONDecodeError, TypeError):
+                        arguments_obj = {}
+
+                    candidate = arguments_obj.get("expoUrl") or arguments_obj.get(
+                        "expo_url"
+                    )
+                    if isinstance(candidate, str) and candidate.strip():
+                        expo_url_candidate = candidate.strip()
+
+                    # 兜底：模型可能只在自然语言里给了 exp://...，而 tool 参数为空
+                    if not expo_url_candidate:
+                        expo_url_candidate = _extract_expo_url(assistant_text)
+                    if not expo_url_candidate:
+                        # 再兜底：从最近一小段日志里提取（避免 join(logs) 过大）
+                        expo_url_candidate = _extract_expo_url(
+                            "\n".join(logs[-10:])
+                        )
+
+                    # 基本校验：要求以 exp:// 开头（前端“查看应用”会直接交给 Expo Go）
+                    if not (expo_url_candidate and expo_url_candidate.startswith("exp://")):
+                        expo_url_candidate = None
+
+                logs.append(f"Tool call: {tool_name}")
+                call_event = AgentEvent(
+                    step_id=step_id,
+                    type="tool_call",
+                    title=f"调用工具：{tool_name}",
+                    detail=None,
+                )
+                events.append(call_event)
+                event_sink(call_event)
+                step_id += 1
+
+                command_step_id = step_id - 1
+                execute_command_hooks = None
+
+                if tool_name == "execute_command":
+                    try:
+                        arguments = json.loads(
+                            tool_call["function"].get("arguments") or "{}"
+                        )
+                        command_str = str(arguments.get("command") or "").strip()
+                    except (json.JSONDecodeError, TypeError):
+                        command_str = "(无法解析命令)"
+
+                    def _on_start(cmd: str) -> None:
+                        ev = AgentEvent(
+                            step_id=command_step_id,
+                            type="command_start",
+                            title="执行命令",
+                            detail=cmd or None,
+                        )
+                        event_sink(ev)
+
+                    def _on_output(chunk: str, stream: str) -> None:
+                        ev = AgentEvent(
+                            step_id=command_step_id,
+                            type="command_output",
+                            title=stream,
+                            detail=chunk or None,
+                        )
+                        event_sink(ev)
+
+                    def _on_end(exit_code: int, _out: str, _err: str) -> None:
+                        if exit_code == -1:
+                            detail = "Exit code: -1 (killed by timeout or signal)."
+                        else:
+                            detail = f"Exit code: {exit_code}"
+                        ev = AgentEvent(
+                            step_id=command_step_id,
+                            type="command_end",
+                            title="命令结束",
+                            detail=detail,
+                        )
+                        event_sink(ev)
+
+                    def _on_command_input_request(prompt_text: str) -> str:
+                        """conversation 模式下的 stdin 自动应答回调。"""
+                        input_system_prompt = (
+                            "You are an automated stdin responder for interactive CLI prompts.\n"
+                            "Output ONLY the exact input to write to stdin (no explanation).\n\n"
+                            "- yes/no prompts: output only 'y' or 'n'.\n"
+                            "- port replacement prompts: default 'y'.\n"
+                            "- Expo 'Press <key>' prompts: output exactly one key from candidate list; prefer 'w' if present.\n"
+                        )
+                        try:
+                            _assistant_text, _tool_calls = api.create_message(
+                                system_prompt=input_system_prompt,
+                                messages=[{"role": "user", "content": prompt_text}],
+                                tools=[],
+                            )
+                            return (_assistant_text or "").strip()
+                        except Exception:
+                            return ""
+
+                    execute_command_hooks = (
+                        _on_start,
+                        _on_output,
+                        _on_end,
+                        _on_command_input_request,
+                    )
+
+                try:
+                    result = run_tool_call(
+                        tool_call,
+                        execute_command_hooks=execute_command_hooks,
+                    )
+                    wrapped = (
+                        f"Tool {tool_call['function']['name']} (id={tool_call['id']}) "
+                        f"result:\n{result}"
+                    )
+                    tool_results.append(wrapped)
+                    result_summary = str(result)
+                except Exception as exc:  # noqa: BLE001
+                    error_text = (
+                        f"Tool {tool_call['function']['name']} (id={tool_call['id']}) error: {exc}"
+                    )
+                    tool_results.append(error_text)
+                    logs.append(error_text)
+                    result_summary = error_text
+
+                result_event = AgentEvent(
+                    step_id=step_id,
+                    type="tool_result",
+                    title=f"工具 {tool_name} 执行完成",
+                    detail=result_summary[:400],
+                )
+                events.append(result_event)
+                event_sink(result_event)
+
+                # 当模型调用 notify_expo_url_ready 且 expo_url 尚未通知过时，
+                # 追加一个可被前端渲染的“查看应用”事件。
+                if (
+                    tool_name == "notify_expo_url_ready"
+                    and expo_url_candidate
+                    and not expo_url_ready_notified
+                ):
+                    expo_url_ready = expo_url_candidate
+                    expo_url_ready_notified = True
+
+                    expo_event = AgentEvent(
+                        step_id=step_id + 1,
+                        type="expo_url_ready",
+                        title="查看应用",
+                        detail=expo_url_candidate,
+                    )
+                    events.append(expo_event)
+                    event_sink(expo_event)
+                    step_id += 2
+                else:
+                    step_id += 1
+
+            # 把本轮 assistant 回复（含 tool_calls）加入对话上下文
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "tool_calls": tool_calls,
+                }
+            )
+            persist_message("assistant", assistant_text, None, tool_calls)
+
+            # 把每个工具的执行结果加入 tool 消息上下文
+            for call, result in zip(tool_calls, tool_results, strict=False):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": result,
+                    }
+                )
+                persist_message("tool", result, call["id"], None)
+
+        # 若没有显式标记 finished，则兜底追加结束事件
+        if not any(evt.type == "finished" for evt in events):
+            finished_event = AgentEvent(
+                step_id=step_id,
+                type="finished",
+                title="任务已结束（达到最大轮数）",
+                detail=final_text[:400] if final_text else None,
+            )
+            events.append(finished_event)
+            event_sink(finished_event)
+
+        joined_text = "\n".join(logs + [final_text])
+        extracted_expo_url = _extract_expo_url(joined_text)
+        # 优先使用 tool 通知得到的 expo_url，确保与前端按钮一致。
+        expo_url = expo_url_ready or extracted_expo_url
+
+        return TaskResult(
+            logs=logs,
+            final_text=final_text,
+            events=events,
+            task_id=run_id,
+            expo_root=expo_root,
+            expo_url=expo_url,
+        )
+    finally:
         if workspace_token is not None:
             reset_task_workspace_root(workspace_token)
 

@@ -23,6 +23,9 @@ class AgentEvent(BaseModel):
         "command_start",
         "command_output",
         "command_end",
+        # AI 生成结束后调用 notify_expo_url_ready tool，
+        # 后端把 expoUrl 通过此事件通知前端。
+        "expo_url_ready",
     ]
     title: str
     detail: Optional[str] = None
@@ -54,4 +57,54 @@ class GenerateAppResponse(BaseModel):
     expoUrl: Optional[str] = None
     # 结构化的过程事件列表，前端可按时间线展示 AI 的工作过程。
     events: List[AgentEvent] = Field(default_factory=list)
+
+
+# =============================
+# Conversation (窗口/多轮聊天)
+# =============================
+
+
+class ConversationItem(BaseModel):
+    conversationId: str
+    title: Optional[str] = None
+    createdAt: int
+    updatedAt: int
+
+
+class CreateConversationResponse(BaseModel):
+    status: Literal["created"] = "created"
+    conversationId: str
+    title: Optional[str] = None
+    expoRoot: str
+
+
+class ListConversationsResponse(BaseModel):
+    conversations: List[ConversationItem] = Field(default_factory=list)
+
+
+class ConversationMessage(BaseModel):
+    """给前端渲染用的消息结构（聊天气泡）。"""
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str
+    toolCallId: Optional[str] = None
+
+
+class ConversationMessagesResponse(BaseModel):
+    conversationId: str
+    messages: List[ConversationMessage] = Field(default_factory=list)
+    title: Optional[str] = None
+
+
+class SendMessageRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    framework: Optional[str] = "expo"
+    # 可选：用于当你允许“手动指定窗口目标/标题”时扩展
+    optionalTitle: Optional[str] = None
+
+
+class SendMessageResponse(BaseModel):
+    status: Literal["accepted"] = "accepted"
+    runId: str
+
 

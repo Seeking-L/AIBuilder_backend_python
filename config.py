@@ -51,6 +51,19 @@ class Settings:
     qwen_api_key: str | None
     # DashScope OpenAI 兼容接口 base_url（可通过环境变量覆盖不同区域）
     dashscope_base_url: str
+    # SQLite 用于持久化 conversation/windows/messages/events
+    db_path: Path
+    # 对话摘要触发阈值（当历史过长时压缩到 summary memory）
+    summary_trigger_chars: int
+    summary_trigger_messages: int
+    # 构造给模型的“最近 N 条消息”
+    recent_messages_for_model: int
+    # CORS 允许的前端源（当需要 cookie 时，不能使用 allow_origins=["*"]）
+    cors_allow_origins: list[str]
+
+    # conversation 过期清理策略（按“最近一次 updated_at”计算）
+    conversation_ttl_days: int
+    cleanup_on_startup: bool
 
 
 def _resolve_workspace_root() -> Path:
@@ -64,6 +77,29 @@ def _resolve_workspace_root() -> Path:
     if workspace_root_from_env:
         return Path(workspace_root_from_env).expanduser().resolve()
     return (BASE_DIR.parent / "AIBuilder_workspace").resolve()
+
+
+def _resolve_db_path(workspace_root: Path) -> Path:
+    """SQLite DB 路径：默认放到工作区根目录下。"""
+    return (workspace_root / "aibuilder.sqlite3").resolve()
+
+
+def _resolve_cors_allow_origins() -> list[str]:
+    """解析 CORS_ALLOW_ORIGINS：逗号分隔的允许源列表。"""
+
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    # 默认兜底：常见本地开发地址；生产环境建议显式配置 CORS_ALLOW_ORIGINS
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4000",
+        "http://127.0.0.1:4000",
+    ]
 
 
 def _resolve_progress_log_path() -> Path:
@@ -93,5 +129,13 @@ settings = Settings(
         "DASHSCOPE_BASE_URL",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ),
+    db_path=_resolve_db_path(_resolve_workspace_root()),
+    summary_trigger_chars=int(os.getenv("SUMMARY_TRIGGER_CHARS", "12000")),
+    summary_trigger_messages=int(os.getenv("SUMMARY_TRIGGER_MESSAGES", "40")),
+    recent_messages_for_model=int(os.getenv("RECENT_MESSAGES_FOR_MODEL", "30")),
+    cors_allow_origins=_resolve_cors_allow_origins(),
+    conversation_ttl_days=int(os.getenv("CONVERSATION_TTL_DAYS", "7")),
+    cleanup_on_startup=os.getenv("CLEANUP_ON_STARTUP", "false").strip().lower()
+    in {"1", "true", "yes", "y", "on"},
 )
 
