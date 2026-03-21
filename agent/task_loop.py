@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
@@ -11,12 +13,13 @@ from openai import OpenAI
 from config import settings
 from .events import AgentEvent
 from .system_prompt import get_system_prompt
-from .task_manager import task_manager
+from .task_manager import emit_progress_log, task_manager
 from .tools import (
+    EXIT_CODE_TOOL_DETACHED,
     run_tool_call,
     tool_definitions,
-    set_task_workspace_root,
     reset_task_workspace_root,
+    set_task_workspace_root,
 )
 
 
@@ -203,6 +206,88 @@ class ApiHandler:
         return text, tool_calls
 
 
+# exp:// 的 authority：IPv6 可能为 [addr]，IPv4/主机名为裸写。
+_EXP_URL_HEAD_RE = re.compile(
+    r"^(exp://)(\[[^\]]+\]|[^/:?#]+)(:\d+)?(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _detect_lan_ipv4() -> str:
+    """探测本机用于默认出站的 IPv4，通常为局域网网卡地址。
+
+    Metro/Expo 常打印 ``exp://localhost:端口``；手机上的 Expo Go 必须访问「运行后端的机器」的
+    局域网 IP。此处用 UDP connect 探测路由选中的源地址，不实际发送数据包。
+
+    无网络或异常时退回 127.0.0.1（此时手机仍不可达，请在环境中设置 EXPO_LAN_HOST）。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+            udp_sock.connect(("8.8.8.8", 80))
+            addr, _port = udp_sock.getsockname()
+            if addr and addr != "0.0.0.0":
+                return addr
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def _resolve_expo_lan_host() -> str:
+    """优先使用配置 EXPO_LAN_HOST，否则自动探测局域网 IPv4。"""
+    configured = settings.expo_lan_host
+    if configured:
+        return configured.strip()
+    return _detect_lan_ipv4()
+
+
+def _format_host_for_exp_authority(host: str) -> str:
+    """将主机名格式化为 exp:// 中 authority 的写法（纯 IPv6 需方括号）。"""
+    h = host.strip()
+    if h.startswith("[") and h.endswith("]"):
+        return h
+    try:
+        parsed = ipaddress.ip_address(h)
+        if parsed.version == 6:
+            return f"[{h}]"
+    except ValueError:
+        pass
+    return h
+
+
+def _is_loopback_exp_host(host: str) -> bool:
+    """判断 exp URL 中的主机是否为回环（模型/Metro 常给 localhost）。"""
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    if h == "127.0.0.1":
+        return True
+    if h in ("::1", "[::1]"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h.strip("[]"))
+        return bool(ip.is_loopback)
+    except ValueError:
+        return False
+
+
+def _rewrite_exp_loopback_to_lan(expo_url: Optional[str]) -> Optional[str]:
+    """若 exp:// 使用 localhost/127.0.0.1 等，替换为后端对手机可见的局域网主机。
+
+    非 exp:// 或非回环主机则原样返回；解析失败时原样返回，避免破坏未知格式。
+    """
+    if not expo_url or not expo_url.startswith("exp://"):
+        return expo_url
+    match = _EXP_URL_HEAD_RE.match(expo_url)
+    if not match:
+        return expo_url
+    prefix, raw_host, port_part, rest = match.groups()
+    if not _is_loopback_exp_host(raw_host):
+        return expo_url
+    lan_host = _resolve_expo_lan_host()
+    formatted = _format_host_for_exp_authority(lan_host)
+    return f"{prefix}{formatted}{port_part or ''}{rest}"
+
+
 def _extract_expo_url(text: str) -> Optional[str]:
     """从文本中尝试提取 Expo URL（例如 exp:// 开头的链接）。"""
     # 优先匹配 exp:// 链接
@@ -228,7 +313,10 @@ def _build_task_initial_user_content(
 
     说明：
     - run_task_loop 目前只支持一次性 description 驱动，因此首条 user 消息会附带较多“开发约束文本”。
-    - conversation 模式会复用系统 prompt + messages 历史，不再依赖这段 user content 里的长约束文本（后续可按需要调整）。
+    - 本条与系统提示词共同约束根路径入口（app/index.tsx）与多页导航；conversation 模式不重复本段，
+      但 get_system_prompt 中仍包含相同的 Entry route and navigation 规则。
+    - 首轮 user 消息额外强调 Metro 相对路径导入规则与 baseExpo 模板摘要，与 system_prompt 中的
+      「Imports and Metro bundler」「baseExpo template snapshot」一致。
     """
 
     effective_expo_root = expo_root or "(not provided)"
@@ -246,7 +334,20 @@ def _build_task_initial_user_content(
             "- Only create or modify files under the Expo app root in these subdirectories: app/, components/common/, hooks/, services/, types/.",
             "- Do NOT modify configuration or tooling files such as package.json, tsconfig.json, ESLint configs, or scripts (e.g. scripts/reset-project.js).",
             "- Use Expo Router file-based routing for pages (e.g. app/profile/index.tsx, app/posts/[id].tsx).",
-            "- Use ScreenContainer, AppText, PrimaryButton, and Spacer from components/common for layout and UI where appropriate.",
+            "- Entry route and navigation (same as system prompt): implement primary functionality in app/index.tsx at `/`; do not leave the default template home while only adding sub-routes.",
+            "- If you add other screens, use expo-router (`Link` or `useRouter` + `router.push`) for navigation; home must show visible paths to subpages, and subpages must be able to return to `/`.",
+            "- Adjust app/_layout.tsx (e.g. Stack.Screen options) when needed for new routes.",
+            "",
+            "Imports (Metro bundler — same as system prompt):",
+            "- Do NOT use `@/` or `from '@/components/common'` (or any barrel import from the `components/common` directory). Metro fails to resolve those; `tsconfig` `@/*` is not a safe signal for bundling.",
+            "- Import each widget from its file with a relative path, e.g. from app/index.tsx: `../components/common/ScreenContainer`, `../components/common/AppText`, etc.; from app/<segment>/index.tsx use `../../components/common/...` (add one `../` per extra nesting level under app/).",
+            "",
+            "baseExpo baseline (template snapshot):",
+            "- app/_layout.tsx: expo-router Stack, index screen with header hidden, StatusBar.",
+            "- app/index.tsx: minimal View/Text placeholder; replace per task.",
+            "- components/common/: ScreenContainer (SafeAreaView + padding), AppText (variant title|body), PrimaryButton (label or children), Spacer (optional size).",
+            "- You may add code under hooks/, services/, types/; prefer ScreenContainer, AppText, PrimaryButton, Spacer for layout and UI where appropriate.",
+            "",
             "- Put network and data access logic into modules under services/; screens should not call fetch directly.",
             "- Before running the Expo dev server, run `npm ci` in the Expo app root to install dependencies.",
             "- Start the Expo dev server with `npm start` or `npx expo start --tunnel` using cwd set to the Expo app root.",
@@ -328,6 +429,9 @@ def run_task_loop(input: TaskInput) -> TaskResult:
             events.append(round_event)
             if input.task_id:
                 task_manager.append_event(input.task_id, round_event)
+            else:
+                # 无 task_id 时仍写入 agent-progress.log，避免「一次性任务」丢失时间线
+                emit_progress_log(None, round_event)
             step_id += 1
 
             # 发起一轮对话，传入当前累积的 messages 和可用工具定义
@@ -348,6 +452,8 @@ def run_task_loop(input: TaskInput) -> TaskResult:
             events.append(llm_event)
             if input.task_id:
                 task_manager.append_event(input.task_id, llm_event)
+            else:
+                emit_progress_log(None, llm_event)
             step_id += 1
 
             # 当模型没有再请求调用工具时，认为已经得到最终结果，可以提前结束循环
@@ -362,6 +468,8 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                 events.append(finished_event)
                 if input.task_id:
                     task_manager.append_event(input.task_id, finished_event)
+                else:
+                    emit_progress_log(None, finished_event)
                 step_id += 1
                 break
 
@@ -381,15 +489,15 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                 events.append(call_event)
                 if input.task_id:
                     task_manager.append_event(input.task_id, call_event)
+                else:
+                    emit_progress_log(None, call_event)
                 step_id += 1
 
                 # 为 execute_command 准备流式回调（实时推送命令与输出）
                 command_step_id = step_id - 1
                 execute_command_hooks = None
-                if (
-                    tool_name == "execute_command"
-                    and input.task_id
-                ):
+                # 无论是否有 task_id，都走流式执行，以便 stdout/stderr 按行写入 agent-progress.log
+                if tool_name == "execute_command":
                     try:
                         arguments = json.loads(
                             tool_call["function"].get("arguments") or "{}"
@@ -416,9 +524,12 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                             title="执行命令",
                             detail=cmd or None,
                         )
-                        task_manager.append_event(input.task_id, ev)
+                        if input.task_id:
+                            task_manager.append_event(input.task_id, ev)
+                        else:
+                            emit_progress_log(None, ev)
                         # 如果当前命令看起来是在启动 Expo dev server，则在任务状态中记录一次启动尝试。
-                        if "expo start" in cmd:
+                        if input.task_id and "expo start" in cmd:
                             task_manager.register_dev_server_start(
                                 input.task_id,
                                 port=dev_server_port,
@@ -433,11 +544,17 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                             title=stream,
                             detail=chunk or None,
                         )
-                        task_manager.append_event(input.task_id, ev)
+                        if input.task_id:
+                            task_manager.append_event(input.task_id, ev)
+                        else:
+                            emit_progress_log(None, ev)
                         # 当输出中出现典型的“Waiting on http://localhost:<port>”提示时，
                         # 说明 dev server 已经成功进入监听状态，可以将其标记为 running。
                         text = chunk or ""
-                        if "Waiting on http://localhost:" in text:
+                        if (
+                            input.task_id
+                            and "Waiting on http://localhost:" in text
+                        ):
                             task_manager.register_dev_server_running(input.task_id)
 
                     def _on_end(exit_code: int, _out: str, _err: str) -> None:
@@ -452,51 +569,22 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                             title="命令结束",
                             detail=detail,
                         )
-                        task_manager.append_event(input.task_id, ev)
+                        if input.task_id:
+                            task_manager.append_event(input.task_id, ev)
+                        else:
+                            emit_progress_log(None, ev)
                         # 无论退出原因如何，命令结束时 dev server 都不再处于运行状态。
-                        if "expo start" in (command_str or ""):
+                        if input.task_id and "expo start" in (command_str or ""):
                             task_manager.register_dev_server_stopped(
                                 input.task_id,
                                 failed=(exit_code != 0),
                             )
 
-                    def _on_command_input_request(prompt_text: str) -> str:
-                        """当子进程请求 stdin 输入时，调用 LLM 自动生成最小输入内容。
-
-                        该回调会被 `agent/tools.py` 在“子进程输出线程”中触发，因此：
-                        - 不修改 messages/main loop；
-                        - 禁用 tools（避免模型再触发 execute_command 等递归调用）；
-                        - 要求模型只输出可直接写入 stdin 的内容（无解释）。
-                        """
-                        input_system_prompt = (
-                            "You are an automated stdin responder for interactive CLI prompts.\n"
-                            "You will receive a detected prompt text from a running process.\n\n"
-                            "Rules (VERY IMPORTANT):\n"
-                            "- Output ONLY the exact input the user should type, with no explanation.\n"
-                            "- For yes/no prompts: output only a single character: 'y' or 'n'.\n"
-                            "- For port-replacement prompts: default to 'y'.\n"
-                            "- For Expo 'Press <key>' prompts: output exactly one key character from the candidate list.\n"
-                            "- If multiple candidates exist and 'w' exists, prefer 'w' (open web). Otherwise choose the first candidate.\n"
-                            "- Output must be a single line.\n"
-                        )
-                        try:
-                            # 禁用工具调用，避免模型递归触发 execute_command。
-                            _assistant_text, _tool_calls = api.create_message(
-                                system_prompt=input_system_prompt,
-                                messages=[{"role": "user", "content": prompt_text}],
-                                tools=[],
-                            )
-                            # 工具层会根据 kind 做进一步 sanitize/兜底。
-                            return (_assistant_text or "").strip()
-                        except Exception:
-                            # 回调失败时返回空字符串，让工具层兜底策略接管。
-                            return ""
-
+                    # 子进程以非交互方式运行（stdin 关闭 + CI=1）；不再向 CLI 注入自动 stdin 应答。
                     execute_command_hooks = (
                         _on_start,
                         _on_output,
                         _on_end,
-                        _on_command_input_request,
                     )
 
                 try:
@@ -527,6 +615,8 @@ def run_task_loop(input: TaskInput) -> TaskResult:
                 events.append(result_event)
                 if input.task_id:
                     task_manager.append_event(input.task_id, result_event)
+                else:
+                    emit_progress_log(None, result_event)
                 step_id += 1
 
             # 将本轮 assistant 的回复（含 tool_calls）加入对话上下文，
@@ -561,10 +651,12 @@ def run_task_loop(input: TaskInput) -> TaskResult:
             events.append(finished_event)
             if input.task_id:
                 task_manager.append_event(input.task_id, finished_event)
+            else:
+                emit_progress_log(None, finished_event)
 
         # 在所有轮次结束后，尝试从日志与最终回复中提取 Expo URL
         joined_text = "\n".join(logs + [final_text])
-        expo_url = _extract_expo_url(joined_text)
+        expo_url = _rewrite_exp_loopback_to_lan(_extract_expo_url(joined_text))
 
         return TaskResult(
             logs=logs,
@@ -625,6 +717,12 @@ def run_conversation_turn(
 
         final_text = ""
 
+        # 对话模式原先只通过 event_sink 写库，不会经过 TaskManager.append_event，导致 agent-progress.log 为空。
+        # 这里统一先落盘进度日志，再调用调用方传入的 sink（保持与「任务模式」相同的可观测性）。
+        def _emit_event(ev: AgentEvent) -> None:
+            emit_progress_log(run_id, ev)
+            event_sink(ev)
+
         for round_index in range(settings.max_task_rounds):
             round_number = round_index + 1
             logs.append(f"--- Round {round_number} ---")
@@ -635,7 +733,7 @@ def run_conversation_turn(
                 detail=None,
             )
             events.append(round_event)
-            event_sink(round_event)
+            _emit_event(round_event)
             step_id += 1
 
             assistant_text, tool_calls = api.create_message(
@@ -652,7 +750,7 @@ def run_conversation_turn(
                 detail=assistant_text[:400],
             )
             events.append(llm_event)
-            event_sink(llm_event)
+            _emit_event(llm_event)
             step_id += 1
 
             if not tool_calls:
@@ -675,7 +773,7 @@ def run_conversation_turn(
                     detail=final_text[:400],
                 )
                 events.append(finished_event)
-                event_sink(finished_event)
+                _emit_event(finished_event)
                 step_id += 1
                 break
 
@@ -710,6 +808,9 @@ def run_conversation_turn(
                     # 基本校验：要求以 exp:// 开头（前端“查看应用”会直接交给 Expo Go）
                     if not (expo_url_candidate and expo_url_candidate.startswith("exp://")):
                         expo_url_candidate = None
+                    else:
+                        # Metro 常输出 exp://localhost:port；手机必须用后端局域网 IP（或 EXPO_LAN_HOST）
+                        expo_url_candidate = _rewrite_exp_loopback_to_lan(expo_url_candidate)
 
                 logs.append(f"Tool call: {tool_name}")
                 call_event = AgentEvent(
@@ -719,7 +820,7 @@ def run_conversation_turn(
                     detail=None,
                 )
                 events.append(call_event)
-                event_sink(call_event)
+                _emit_event(call_event)
                 step_id += 1
 
                 command_step_id = step_id - 1
@@ -741,7 +842,7 @@ def run_conversation_turn(
                             title="执行命令",
                             detail=cmd or None,
                         )
-                        event_sink(ev)
+                        _emit_event(ev)
 
                     def _on_output(chunk: str, stream: str) -> None:
                         ev = AgentEvent(
@@ -750,10 +851,14 @@ def run_conversation_turn(
                             title=stream,
                             detail=chunk or None,
                         )
-                        event_sink(ev)
+                        _emit_event(ev)
 
                     def _on_end(exit_code: int, _out: str, _err: str) -> None:
-                        if exit_code == -1:
+                        if exit_code == EXIT_CODE_TOOL_DETACHED:
+                            detail = (
+                                "Dev server is ready; tool returned early (child still running)."
+                            )
+                        elif exit_code == -1:
                             detail = "Exit code: -1 (killed by timeout or signal)."
                         else:
                             detail = f"Exit code: {exit_code}"
@@ -763,32 +868,13 @@ def run_conversation_turn(
                             title="命令结束",
                             detail=detail,
                         )
-                        event_sink(ev)
+                        _emit_event(ev)
 
-                    def _on_command_input_request(prompt_text: str) -> str:
-                        """conversation 模式下的 stdin 自动应答回调。"""
-                        input_system_prompt = (
-                            "You are an automated stdin responder for interactive CLI prompts.\n"
-                            "Output ONLY the exact input to write to stdin (no explanation).\n\n"
-                            "- yes/no prompts: output only 'y' or 'n'.\n"
-                            "- port replacement prompts: default 'y'.\n"
-                            "- Expo 'Press <key>' prompts: output exactly one key from candidate list; prefer 'w' if present.\n"
-                        )
-                        try:
-                            _assistant_text, _tool_calls = api.create_message(
-                                system_prompt=input_system_prompt,
-                                messages=[{"role": "user", "content": prompt_text}],
-                                tools=[],
-                            )
-                            return (_assistant_text or "").strip()
-                        except Exception:
-                            return ""
-
+                    # 子进程以非交互方式运行（stdin 关闭 + CI=1）；不再向 CLI 注入自动 stdin 应答。
                     execute_command_hooks = (
                         _on_start,
                         _on_output,
                         _on_end,
-                        _on_command_input_request,
                     )
 
                 try:
@@ -817,7 +903,7 @@ def run_conversation_turn(
                     detail=result_summary[:400],
                 )
                 events.append(result_event)
-                event_sink(result_event)
+                _emit_event(result_event)
 
                 # 当模型调用 notify_expo_url_ready 且 expo_url 尚未通知过时，
                 # 追加一个可被前端渲染的“查看应用”事件。
@@ -836,7 +922,7 @@ def run_conversation_turn(
                         detail=expo_url_candidate,
                     )
                     events.append(expo_event)
-                    event_sink(expo_event)
+                    _emit_event(expo_event)
                     step_id += 2
                 else:
                     step_id += 1
@@ -871,10 +957,10 @@ def run_conversation_turn(
                 detail=final_text[:400] if final_text else None,
             )
             events.append(finished_event)
-            event_sink(finished_event)
+            _emit_event(finished_event)
 
         joined_text = "\n".join(logs + [final_text])
-        extracted_expo_url = _extract_expo_url(joined_text)
+        extracted_expo_url = _rewrite_exp_loopback_to_lan(_extract_expo_url(joined_text))
         # 优先使用 tool 通知得到的 expo_url，确保与前端按钮一致。
         expo_url = expo_url_ready or extracted_expo_url
 

@@ -61,6 +61,10 @@ class Settings:
     # CORS 允许的前端源（当需要 cookie 时，不能使用 allow_origins=["*"]）
     cors_allow_origins: list[str]
 
+    # 当模型传入 exp://localhost:... 时，回填为可供手机 Expo Go 访问的主机（显式 IP/域名）。
+    # 不设则运行时自动探测本机局域网 IPv4；Docker/多网卡环境建议显式配置。
+    expo_lan_host: str | None
+
     # conversation 过期清理策略（按“最近一次 updated_at”计算）
     conversation_ttl_days: int
     cleanup_on_startup: bool
@@ -102,6 +106,14 @@ def _resolve_cors_allow_origins() -> list[str]:
     ]
 
 
+def _optional_nonempty_str(value: str | None) -> str | None:
+    """环境变量常见空串视为未设置。"""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _resolve_progress_log_path() -> Path:
     """进度日志文件路径：优先 PROGRESS_LOG_PATH，否则为项目根目录 logs/agent-progress.log。"""
     log_path_env = os.getenv("PROGRESS_LOG_PATH")
@@ -134,6 +146,7 @@ settings = Settings(
     summary_trigger_messages=int(os.getenv("SUMMARY_TRIGGER_MESSAGES", "40")),
     recent_messages_for_model=int(os.getenv("RECENT_MESSAGES_FOR_MODEL", "30")),
     cors_allow_origins=_resolve_cors_allow_origins(),
+    expo_lan_host=_optional_nonempty_str(os.getenv("EXPO_LAN_HOST")),
     conversation_ttl_days=int(os.getenv("CONVERSATION_TTL_DAYS", "7")),
     cleanup_on_startup=os.getenv("CLEANUP_ON_STARTUP", "false").strip().lower()
     in {"1", "true", "yes", "y", "on"},

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import threading
-import concurrent.futures
-import logging
 import time
-import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, MutableMapping, Optional
 from contextvars import ContextVar
@@ -24,8 +22,6 @@ _CURRENT_WORKSPACE_ROOT: ContextVar[Path] = ContextVar(
     "CURRENT_WORKSPACE_ROOT",
     default=settings.workspace_root.resolve(),
 )
-
-_auto_stdin_logger = logging.getLogger("agent.auto_stdin")
 
 
 def get_effective_workspace_root() -> Path:
@@ -49,7 +45,12 @@ TOOL_DEFINITIONS: List[ToolDefinition] = [
         "function": {
             "name": "execute_command",
             # 描述：让 LLM 可以在后端工作区内执行一条 shell 命令
-            "description": "Execute a shell command in the project workspace (for tests, builds, etc).",
+            "description": (
+                "Execute a shell command in the project workspace (for tests, builds, dev servers, etc). "
+                "Commands always run in a non-interactive child environment: stdin is closed (no prompts), "
+                "and CI=1 / EXPO_NO_INTERACTIVE=1 are set so tools like Expo CLI should not block on y/n. "
+                "Do not rely on interactive prompts; pass explicit flags (e.g. --port after get_available_port)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -71,7 +72,11 @@ TOOL_DEFINITIONS: List[ToolDefinition] = [
                     # 可选：标记为长时间运行的命令（如 dev server），禁用超时自动终止
                     "longRunning": {
                         "type": "boolean",
-                        "description": "Set true for long-running dev servers; disables timeout-based termination.",
+                        "description": (
+                            "Set true for long-running dev servers (e.g. Metro). Disables normal command timeout; "
+                            "the tool returns automatically once the server prints a ready line (e.g. Waiting on http://localhost:...) "
+                            "while the child process keeps running in the background."
+                        ),
                     },
                 },
                 "required": ["command"],
@@ -154,6 +159,16 @@ TOOL_DEFINITIONS: List[ToolDefinition] = [
 tool_definitions: List[ToolDefinition] = TOOL_DEFINITIONS
 
 
+# Metro / Expo 已就绪时常见的日志片段（与 `task_loop` 里 `register_dev_server_running` 的判定保持一致）。
+_LONG_RUNNING_READY_MARKERS: tuple[str, ...] = (
+    "Waiting on http://localhost:",
+)
+# longRunning 时等待上述就绪日志的最长时间（秒）；超时则杀进程并返回错误。
+_LONG_RUNNING_STARTUP_TIMEOUT_SEC = 180.0
+# 传给 `on_command_end` 的约定：子进程仍在跑，工具为释放 agent 循环而提前返回。
+EXIT_CODE_TOOL_DETACHED: int = -2
+
+
 def _ensure_within_workspace(path: Path) -> Path:
     """确保目标路径在当前任务的 workspace 根目录内，并且不指向共享 baseExpo 模板。
 
@@ -184,18 +199,30 @@ def _ensure_within_workspace(path: Path) -> Path:
     return target
 
 
+def _command_child_env() -> dict[str, str]:
+    """为子进程准备环境变量：强制“非交互”语义，避免 Expo/npm 等卡在 y/n 提示上。
+
+    - ``CI=1``：广泛被 CI 工具链识别；Expo CLI 会据此减少或禁用交互式 prompt。
+    - ``EXPO_NO_INTERACTIVE=1``：对 Expo 相关 CLI 的额外提示，与 ``CI`` 叠加更稳。
+
+    说明：对 ``os.environ`` 做浅拷贝再覆盖键，避免修改当前进程全局环境。
+    """
+    env: dict[str, str] = dict(os.environ)
+    env["CI"] = "1"
+    env["EXPO_NO_INTERACTIVE"] = "1"
+    return env
+
+
 def _read_stream(
     pipe: Any,
     stream_name: Literal["stdout", "stderr"],
     parts: List[str],
-    on_output: Optional[Callable[[str, Literal["stdout", "stderr", "stdin"]], None]],
-    on_raw_char: Optional[Callable[[str, Literal["stdout", "stderr"]], None]] = None,
+    on_output: Optional[Callable[[str, Literal["stdout", "stderr"]], None]],
 ) -> None:
     """在单独线程中读取管道。
 
-    - 由于 Expo CLI / 其它交互式程序的提示可能不以换行结尾（会导致 readline() 阻塞），
-      这里改为按字符读取，并在检测到 '\n' 后再按行回调。
-    - 同时把“原始字符流”交给上层做 prompt detector。
+    按字符读取并在遇到换行符后整行回调，避免某些 CLI 长时间不输出 ``\\n`` 时
+    `readline()` 一直阻塞、上层看不到半行提示的情况。
     """
     if pipe is None:
         return
@@ -206,8 +233,6 @@ def _read_stream(
             if ch == "":
                 break
             line_buf += ch
-            if on_raw_char:
-                on_raw_char(ch, stream_name)
             if ch == "\n":
                 parts.append(line_buf)
                 if on_output:
@@ -231,10 +256,8 @@ def execute_command_tool(
     args: Mapping[str, Any],
     *,
     on_command_start: Optional[Callable[[str], None]] = None,
-    on_command_output: Optional[Callable[[str, Literal["stdout", "stderr", "stdin"]], None]] = None,
+    on_command_output: Optional[Callable[[str, Literal["stdout", "stderr"]], None]] = None,
     on_command_end: Optional[Callable[[int, str, str], None]] = None,
-    on_command_input_request: Optional[Callable[[str], str]] = None,
-    max_auto_inputs: int = 5,
 ) -> str:
     # 从 tool 调用参数中解析出要执行的命令；若缺失则报错
     command = str(args.get("command") or "").strip()
@@ -258,15 +281,22 @@ def execute_command_tool(
     else:
         cwd_path = _ensure_within_workspace(base)
 
+    child_env = _command_child_env()
+
     use_streaming = (
         on_command_start is not None
         or on_command_output is not None
         or on_command_end is not None
-        or on_command_input_request is not None
     )
 
     if not use_streaming:
-        # 无回调时保持原有 subprocess.run 行为
+        # longRunning 必须走流式路径，否则 subprocess.run(..., timeout=None) 会永远等子进程退出。
+        if long_running:
+            return (
+                "[execute_command] longRunning=true requires streaming command hooks "
+                "(internal error: the agent loop must pass output hooks for dev servers)."
+            )
+        # 无回调：一次性收集输出；stdin 关闭 + 非交互环境，避免子进程等待用户输入
         try:
             completed = subprocess.run(
                 command,
@@ -277,6 +307,8 @@ def execute_command_tool(
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_float,
+                stdin=subprocess.DEVNULL,
+                env=child_env,
             )
         except subprocess.TimeoutExpired as exc:
             return (
@@ -311,23 +343,23 @@ def execute_command_tool(
             f"--- stderr ---\n{stderr}"
         )
 
-    # 流式模式：Popen + 读线程
+    # 流式模式：Popen + 读线程（仍不打开 stdin，避免交互阻塞）
     if on_command_start:
         on_command_start(command)
 
     try:
-        stdin = subprocess.PIPE if on_command_input_request is not None else subprocess.DEVNULL
         process = subprocess.Popen(
             command,
             shell=True,
             cwd=str(cwd_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            stdin=stdin,
+            env=child_env,
         )
     except Exception as exc:
         if on_command_end:
@@ -337,309 +369,101 @@ def execute_command_tool(
     stdout_parts: List[str] = []
     stderr_parts: List[str] = []
 
-    # ------- 自动交互输入（AI 回应交互式 stdin） -------
-    # 注意：_read_stream 会在读线程里触发 on_raw_char；因此这里需要用锁保证：
-    # - 同一时间只允许一次自动输入决策（避免重复写 stdin）
-    # - LLM 调用期间不会并发触发多个输入
-    auto_input_lock = threading.Lock()
-    auto_input_count = 0
-    auto_input_timeout_seconds = 25.0
-    auto_input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    raw_prompt_buffer = ""
-    raw_buffer_max_chars = 4000
-    last_prompt_scan_log_ts = 0.0
-
-    def _detect_prompt(buf: str) -> Optional[dict[str, Any]]:
-        # 返回结构示例：
-        # { "kind": "yesno"|"presskey"|"unknown", "prompt": "...", "keys": [...] }
-        # 归一化输入，兼容：
-        # - 终端/CLI 可能插入 ANSI escape code
-        # - 全角问号等字符差异
-        # - prompt 末尾可能出现 `»` / 其它装饰字符
-        cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", buf)
-        cleaned = cleaned.replace("？", "?")
-        lowered = cleaned.lower()
-
-        # 1) Port conflict / yes/no 类：识别 Use port <n> instead + (Y/n) / (y/N) 之类
-        # 形如：`? Use port 8083 instead? » (Y/n)`
-        port_m = re.search(
-            r"Use\s+port\s+(\d+)\s+instead",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        yesno_m = re.search(r"\(([Yy])\s*/\s*([Nn])\)", cleaned)
-        if port_m and yesno_m:
-            tail = cleaned[-600:]
-            # Determine default from the case of the letters in the prompt:
-            # - (Y/n) => default "Y"
-            # - (y/N) => default "N"
-            # (Y/n) => default "y"; (y/N) => default "n"
-            default_choice = "y"
-            if yesno_m.group(1) == "y" and yesno_m.group(2) == "N":
-                default_choice = "n"
-            return {
-                "kind": "yesno",
-                "prompt": (
-                    "[AUTO_PROMPT]\nPort conflict detected.\n"
-                    f"PROMPT_TEXT:\n{tail}"
-                ),
-                "keys": [port_m.group(1)],
-                "default": default_choice,
-            }
-
-        # 2) 通用 yes/no：识别 (Y/n) / (y/N) / (y/n) 等
-        yesno_general_m = re.search(r"\(([Yy])\s*/\s*([Nn])\)", cleaned)
-        if yesno_general_m:
-            tail = cleaned[-600:]
-            # (Y/n) => default "y"; (y/N) => default "n"
-            default_choice = "y"
-            if yesno_general_m.group(1) == "y" and yesno_general_m.group(2) == "N":
-                default_choice = "n"
-            return {
-                "kind": "yesno",
-                "prompt": (
-                    "[AUTO_PROMPT]\nYes/No confirmation detected.\n"
-                    f"PROMPT_TEXT:\n{tail}"
-                ),
-                "keys": [],
-                "default": default_choice,
-            }
-
-        # 3) Press <key> 类：expo-cli 常见 `Press s │ switch...`
-        # 这里不强依赖 `│`，只要看到 `Press <alnum>` 就提取 key 候选。
-        if "press" in lowered:
-            keys = re.findall(r"Press\s+([a-zA-Z0-9])", cleaned)
-            if keys:
-                # 去重但保持顺序
-                seen: set[str] = set()
-                uniq_keys: list[str] = []
-                for k in keys:
-                    if k not in seen:
-                        seen.add(k)
-                        uniq_keys.append(k)
-                tail = cleaned[-900:]
-                return {
-                    "kind": "presskey",
-                    "prompt": (
-                        "[AUTO_PROMPT]\nExpo keypress detected.\n"
-                        f"CANDIDATE_KEYS:{uniq_keys}\n"
-                        f"PROMPT_TEXT:\n{tail}"
-                    ),
-                    "keys": uniq_keys,
-                }
-
-        return None
-
-    def _sanitize_input_for_kind(kind: str, raw_text: str, candidate_keys: list[str]) -> str:
-        txt = (raw_text or "").strip()
-        if not txt:
-            # 默认兜底：是 yes/no 就回答 y；是 keypress 就选第一个 candidate
-            if kind == "yesno":
-                return "y"
-            if kind == "presskey" and candidate_keys:
-                return candidate_keys[0]
-            return ""
-
-        low = txt.lower()
-        if kind == "yesno":
-            if low in {"y", "yes"}:
-                return "y"
-            if low in {"n", "no"}:
-                return "n"
-            # 若模型输出了其它内容，优先猜第一个 y/n
-            if "y" in low and "n" not in low:
-                return "y"
-            if "n" in low and "y" not in low:
-                return "n"
-            return "y"
-
-        if kind == "presskey":
-            # 只取第一个候选字符；优先落在 candidate keys 里
-            for ch in txt:
-                if not ch.strip():
-                    continue
-                if not candidate_keys or ch in candidate_keys:
-                    return ch
-            return candidate_keys[0] if candidate_keys else ""
-
-        # unknown：尽量原样但去掉尾随换行
-        return txt.replace("\r", "").replace("\n", "")
-
     t_stdout = threading.Thread(
         target=_read_stream,
-        args=(process.stdout, "stdout", stdout_parts, on_command_output, None),
+        args=(process.stdout, "stdout", stdout_parts, on_command_output),
     )
     t_stderr = threading.Thread(
         target=_read_stream,
-        args=(process.stderr, "stderr", stderr_parts, on_command_output, None),
-    )
-
-    def _on_raw_char(ch: str, stream: Literal["stdout", "stderr"]) -> None:
-        # stream 参数暂时未用于差异化处理，但预留给后续扩展（例如只从 stdout 探测）
-        nonlocal raw_prompt_buffer, auto_input_count
-        # 仅处理当 stdin 可写时（即存在 on_command_input_request）
-        if on_command_input_request is None:
-            return
-
-        raw_prompt_buffer += ch
-        if len(raw_prompt_buffer) > raw_buffer_max_chars:
-            raw_prompt_buffer = raw_prompt_buffer[-raw_buffer_max_chars:]
-
-        # 增强可观测性：如果缓冲区里出现了 Expo 典型交互关键字，做一次节流日志（避免每字符刷屏）。
-        try:
-            lowered_buf = raw_prompt_buffer.lower()
-            if ("use port" in lowered_buf) or ("press " in lowered_buf):
-                import time as _time
-
-                now_ts = _time.time()
-                nonlocal last_prompt_scan_log_ts
-                if now_ts - last_prompt_scan_log_ts > 1.0:
-                    last_prompt_scan_log_ts = now_ts
-                    _auto_stdin_logger.info(
-                        "AUTO_PROMPT_SCAN tail=%r",
-                        raw_prompt_buffer[-200:],
-                    )
-        except Exception:
-            pass
-
-        detected = _detect_prompt(raw_prompt_buffer)
-        if not detected:
-            return
-
-        # 自动输入有上限；避免无限循环
-        if auto_input_count >= max_auto_inputs:
-            return
-
-        # 防止并发重复输入
-        if not auto_input_lock.acquire(blocking=False):
-            return
-
-        # 抢占成功后立即清空缓冲区，避免同一 prompt 在等待 LLM 时重复触发
-        try:
-            auto_input_count += 1
-            kind = detected.get("kind") or "unknown"
-            candidate_keys = detected.get("keys") or []
-            default_choice = detected.get("default")
-            prompt_text = detected.get("prompt") or raw_prompt_buffer
-
-            raw_prompt_buffer = ""
-
-            # --- deterministic stdin decision for known prompt kinds ---
-            # 为了避免 LLM/超时导致的不确定性：当我们已能明确识别 yes/no 或 press key 时，
-            # 直接写入确定性输入；仅 unknown 或缺信息时才调用 LLM。
-            deterministic_input: Optional[str] = None
-            if kind == "yesno":
-                # Prefer detected default if available; otherwise default to "y".
-                deterministic_input = default_choice or "y"
-            elif kind == "presskey":
-                # Prefer 'w' (open web) if present; otherwise pick the first candidate.
-                if candidate_keys:
-                    deterministic_input = "w" if "w" in candidate_keys else candidate_keys[0]
-                else:
-                    deterministic_input = None
-
-            if deterministic_input is not None:
-                model_input = deterministic_input
-            else:
-                # fallback to LLM only when we can't decide deterministically
-                try:
-                    future = auto_input_executor.submit(
-                        on_command_input_request, prompt_text
-                    )
-                    model_input = future.result(timeout=auto_input_timeout_seconds)
-                except Exception as exc:
-                    # LLM 失败时降级为兜底策略
-                    if on_command_output:
-                        try:
-                            on_command_output(f"[auto-input-error] {exc}\n", "stdin")
-                        except Exception:
-                            pass
-                    model_input = ""
-
-            sanitized = _sanitize_input_for_kind(kind, model_input, candidate_keys)
-            if not sanitized:
-                return
-
-            if process.stdin is None:
-                return
-
-            # yes/no 类通常需要换行结束输入；keypress 类尽量只写单字符，避免额外换行造成“下一次输入”
-            if kind == "presskey":
-                process.stdin.write(sanitized)
-            else:
-                process.stdin.write(sanitized + "\n")
-            process.stdin.flush()
-
-            # 可观测性：写入前先打点，方便你确认 detector 命中 + stdin 写入是否发生。
-            try:
-                _auto_stdin_logger.info(
-                    "AUTO_STDIN_WRITE kind=%s default=%r candidates=%r raw_input=%r written=%r",
-                    kind,
-                    default_choice,
-                    candidate_keys,
-                    model_input,
-                    sanitized,
-                )
-            except Exception:
-                pass
-
-            if on_command_output:
-                try:
-                    on_command_output(f"[auto-stdin] {sanitized}\n", "stdin")
-                except Exception:
-                    pass
-        finally:
-            auto_input_lock.release()
-
-    # 重新创建线程（需要把 on_raw_char 绑定进 args）
-    t_stdout = threading.Thread(
-        target=_read_stream,
-        args=(process.stdout, "stdout", stdout_parts, on_command_output, _on_raw_char),
-    )
-    t_stderr = threading.Thread(
-        target=_read_stream,
-        args=(process.stderr, "stderr", stderr_parts, on_command_output, _on_raw_char),
+        args=(process.stderr, "stderr", stderr_parts, on_command_output),
     )
     t_stdout.daemon = True
     t_stderr.daemon = True
     t_stdout.start()
     t_stderr.start()
 
+    detached_early = False
+    returncode = 0
+
     try:
-        returncode = process.wait(timeout=timeout_float)
-    except subprocess.TimeoutExpired:
-        # 仅对非长时间运行命令应用超时终止逻辑
-        process.kill()
-        process.wait()
-        returncode = -1
-        timeout_msg = (
-            f"Timeout after {timeout_float} seconds while running: {command}"
-        )
-        if on_command_end:
-            on_command_end(-1, "\n".join(stdout_parts), timeout_msg)
-        return f"[execute_command] {timeout_msg}"
+        if long_running:
+            # 长驻进程不能 process.wait(None)，否则工具永不返回、对话卡住。
+            # 在输出中出现 Metro 就绪行后提前返回；子进程与读线程继续排空管道，避免 Metro 写满缓冲区阻塞。
+            deadline = time.monotonic() + _LONG_RUNNING_STARTUP_TIMEOUT_SEC
+            while True:
+                combined = "".join(stdout_parts) + "".join(stderr_parts)
+                if any(marker in combined for marker in _LONG_RUNNING_READY_MARKERS):
+                    full_stdout = "".join(stdout_parts)
+                    full_stderr = "".join(stderr_parts)
+                    detached_early = True
+                    if on_command_end:
+                        on_command_end(
+                            EXIT_CODE_TOOL_DETACHED, full_stdout, full_stderr
+                        )
+                    prefix = "[execute_command] Long-running command"
+                    notes = [
+                        "Metro / dev server reported it is listening; tool returned so the agent can continue.",
+                        "The child process is still running; readers keep draining stdout/stderr in the background.",
+                    ]
+                    notes_text = ("\n".join(notes) + "\n") if notes else ""
+                    return (
+                        f"{prefix}: {command}\n"
+                        f"Exit code: 0 (dev server ready; tool returned early while process keeps running)\n"
+                        f"{notes_text}"
+                        f"--- stdout ---\n{full_stdout}\n"
+                        f"--- stderr ---\n{full_stderr}"
+                    )
+                rc = process.poll()
+                if rc is not None:
+                    returncode = rc
+                    break
+                if time.monotonic() > deadline:
+                    process.kill()
+                    try:
+                        process.wait(timeout=30)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    returncode = -1
+                    break
+                time.sleep(0.15)
+
+            if process.poll() is None:
+                try:
+                    returncode = process.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    returncode = -1
+        else:
+            try:
+                returncode = process.wait(timeout=timeout_float)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                returncode = -1
+                timeout_msg = (
+                    f"Timeout after {timeout_float} seconds while running: {command}"
+                )
+                if on_command_end:
+                    on_command_end(-1, "\n".join(stdout_parts), timeout_msg)
+                return f"[execute_command] {timeout_msg}"
     finally:
-        if process.stdin:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
-        if process.stdout:
-            try:
-                process.stdout.close()
-            except OSError:
-                pass
-        if process.stderr:
-            try:
-                process.stderr.close()
-            except OSError:
-                pass
-        try:
-            auto_input_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        t_stdout.join(timeout=2.0)
-        t_stderr.join(timeout=2.0)
+        if not detached_early:
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if process.stdout:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+            if process.stderr:
+                try:
+                    process.stderr.close()
+                except OSError:
+                    pass
+            t_stdout.join(timeout=2.0)
+            t_stderr.join(timeout=2.0)
 
     full_stdout = "".join(stdout_parts)
     full_stderr = "".join(stderr_parts)
@@ -658,7 +482,8 @@ def execute_command_tool(
         )
     if long_running:
         notes.append(
-            "This command was marked as long-running; it is expected to keep running until it is stopped externally."
+            "This command was marked as long-running; the child exited before a ready line was detected "
+            f"(waited up to {_LONG_RUNNING_STARTUP_TIMEOUT_SEC:.0f}s), or exited normally."
         )
     notes_text = ("\n".join(notes) + "\n") if notes else ""
 
@@ -739,7 +564,7 @@ def _is_tcp_port_free_probe(port: int) -> bool:
         sock = socket.socket(af, socket.SOCK_STREAM)
 
         # SO_EXCLUSIVEADDRUSE 能更严格地防止其它进程占用同一地址/端口。
-        # 注意：这属于“探测时”的严格约束；我们会在探测结束后立刻 close socket。
+        # 注意：这属于“探测时”的约束；我们会在探测结束后立刻 close socket。
         if exclusive_opt is not None:
             try:
                 sock.setsockopt(socket.SOL_SOCKET, exclusive_opt, 1)  # type: ignore[arg-type]
@@ -776,7 +601,6 @@ def run_tool_call(
             Optional[Callable[[str], None]],
             Optional[Callable[[str, Literal["stdout", "stderr"]], None]],
             Optional[Callable[[int, str, str], None]],
-            Optional[Callable[[str], str]],
         ]
     ] = None,
 ) -> str:
@@ -785,7 +609,7 @@ def run_tool_call(
 
     兼容 OpenAI Python SDK 的对象形式和普通 dict 形式。
     execute_command_hooks 可选，为：
-      (on_command_start, on_command_output, on_command_end, on_command_input_request)
+      (on_command_start, on_command_output, on_command_end)
     """
 
     # 小工具：同时兼容 SDK 对象属性访问和 dict 访问
@@ -813,7 +637,6 @@ def run_tool_call(
             kwargs["on_command_start"] = execute_command_hooks[0]
             kwargs["on_command_output"] = execute_command_hooks[1]
             kwargs["on_command_end"] = execute_command_hooks[2]
-            kwargs["on_command_input_request"] = execute_command_hooks[3]
         return execute_command_tool(arguments, **kwargs)
     if name == "write_to_file":
         return write_file_tool(arguments)
@@ -827,4 +650,3 @@ def run_tool_call(
         return "[notify_expo_url_ready] acknowledged"
 
     raise ValueError(f"Unknown tool name: {name}")
-

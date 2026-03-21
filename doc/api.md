@@ -1,7 +1,60 @@
 #
-# tasks 路由接口文档
-# 本文件内容来自 `routers/tasks.py`。
+# AIBuilder Python Backend — HTTP / WebSocket 接口总览
 #
+# 路由来源：
+# - `main.py`：`/health`、`/maintenance/cleanup`
+# - `routers/tasks.py`：`/tasks/*`
+# - `routers/conversations.py`：`/conversations/*`
+#
+# 数据模型见 `models.py`。
+#
+
+## 接口索引
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查 |
+| POST | `/maintenance/cleanup` | 手动触发过期 conversation 清理 |
+| POST | `/tasks/generate-app` | 同步生成应用（阻塞至完成） |
+| POST | `/tasks/generate-app-async` | 异步启动生成任务 |
+| WebSocket | `/tasks/ws/{task_id}` | 任务过程事件推送 |
+| POST | `/conversations` | 创建对话窗口 |
+| GET | `/conversations` | 列出当前会话下的对话 |
+| GET | `/conversations/{conversationId}` | 获取对话详情 |
+| GET | `/conversations/{conversationId}/messages` | 获取聊天气泡历史 |
+| POST | `/conversations/{conversationId}/messages` | 发送用户消息并启动一次 run |
+| WebSocket | `/conversations/ws/{conversationId}/{runId}` | 单次 run 的过程事件推送 |
+
+---
+
+## `GET /health`
+
+用途：简单健康检查，供前端或运维探活。
+
+成功响应（200）：
+- `status`：`"ok"`
+- `workspaceRoot`：string（配置中的工作区根目录绝对路径字符串）
+
+---
+
+## `POST /maintenance/cleanup`
+
+用途：手动触发过期 conversation 清理（删除数据库记录及对应生成目录）。行为与启动时可选清理一致，见 `config.cleanup_on_startup` / `conversation_ttl_days`。
+
+请求体：无
+
+成功响应（200）：
+- `status`：`"ok"`
+- `deleted`：number（本次删除的 conversation 数量）
+
+失败响应（500）：
+- JSON：`{ "error": "<异常信息字符串>" }`
+
+---
+
+## Tasks（`routers/tasks.py`）
+
+---
 
 ## `POST /tasks/generate-app`
 
@@ -9,7 +62,7 @@
 
 请求体（JSON，`GenerateAppRequest`）：
 - `description`：string，必填，最小长度 1
-- `framework`：string，选填；默认通常为 `expo`
+- `framework`：string，选填；默认 `expo`
 
 成功响应（200，`GenerateAppResponse`）：
 - `status`：`"completed"`
@@ -39,7 +92,7 @@
 
 请求体（JSON，`GenerateAppRequest`）：
 - `description`：string，必填，最小长度 1
-- `framework`：string，选填；默认通常为 `expo`
+- `framework`：string，选填；默认 `expo`
 
 响应（200，`StartGenerateAppResponse`）：
 - `status`：`"accepted"`
@@ -81,7 +134,8 @@
 
 说明：
 - 无登录态：服务端使用匿名 `session_id` cookie 隔离不同访客创建的 conversation。
-- 所有 `/conversations/*` 请求与 WebSocket 连接都会校验 `session_id`，未携带 cookie 的请求会失败。
+- HTTP：`main.py` 中间件会在响应中补写缺失的 `session_id` cookie；但 `routers/conversations.py` 在读取时若仍无 cookie 会返回 **401**（例如被客户端禁用 cookie 等极端情况）。
+- WebSocket 不经过上述 HTTP 中间件：连接必须在握手请求中携带有效 `session_id` cookie，否则服务端会推送失败状态后关闭连接（见下文）。
 
 ---
 
@@ -97,6 +151,9 @@
 - `title`：string 或 `null`
 - `expoRoot`：string（`generated/<conversation-id>/baseExpo`）
 
+错误响应（401）：
+- 缺少 session cookie：`{ "detail": "Missing session cookie" }`（FastAPI 默认 JSON 结构）
+
 ---
 
 ## `GET /conversations`
@@ -104,7 +161,9 @@
 用途：列出当前 `session_id` 下的所有 conversation（用于刷新后的窗口列表）。
 
 成功响应（200，`ListConversationsResponse`）：
-- `conversations`：数组（每项包含 `conversationId/title/createdAt/updatedAt`）
+- `conversations`：数组（每项包含 `conversationId`、`title`、`createdAt`、`updatedAt`）
+
+错误响应（401）：同上。
 
 ---
 
@@ -118,6 +177,10 @@
 - `title`：string 或 `null`
 - `expoRoot`：string
 
+错误响应：
+- **401**：缺少 session cookie
+- **404**：`{ "detail": "Conversation not found" }`（不属于当前 session 或不存在）
+
 ---
 
 ## `GET /conversations/{conversationId}/messages`
@@ -128,9 +191,11 @@
 - `conversationId`：string
 - `title`：string 或 `null`
 - `messages`：数组，每项：
-  - `role`：`"user" | "assistant" | "tool"`
+  - `role`：`"system" | "user" | "assistant" | "tool"`
   - `content`：string
-  - `toolCallId`：string（仅当 role 为 `tool` 时通常有值）
+  - `toolCallId`：string 或 `null`（`tool` 角色时通常有值）
+
+错误响应：**401**、**404**（conversation 不存在或不属于当前 session）
 
 ---
 
@@ -141,11 +206,18 @@
 请求体（JSON，`SendMessageRequest`）：
 - `text`：string，必填（最小长度 1）
 - `framework`：string，选填（默认 `expo`）
-- `optionalTitle`：string，选填（当前实现未强制使用）
+- `optionalTitle`：string，选填（预留字段，当前实现未强制使用）
 
 成功响应（200，`SendMessageResponse`）：
 - `status`：`"accepted"`
 - `runId`：string
+
+错误响应：
+- **401**：缺少 session cookie
+- **404**：conversation 不存在
+- **409**：该 conversation 已有一个进行中的 run：`{ "detail": "A run is already running for this conversation" }`
+
+说明：首轮发送时若 title 为空，服务端会用本条 `text` 截断生成 conversation 标题（最长约 60 字符加省略）。
 
 ---
 
@@ -153,22 +225,38 @@
 
 用途：实时推送该 run 的 Agent 过程事件；run 完成后推送最终状态并关闭连接。
 
-URL 参数：
-- `lastStepId`：number，可选。用于断线重连的增量补发（仅推送 `stepId > lastStepId` 的新事件）。
+查询参数（Query）：
+- `lastStepId`：number，可选，默认按 `0` 处理。断线重连时用于增量：仅推送 `stepId > lastStepId` 的事件（与同 `stepId` 内细粒度参数配合使用）。
+- `lastEventSeq`：number，可选。同一 `stepId` 下多条事件时的精确增量游标；**未传时服务端为兼容旧客户端会采用保守策略（等价于从该 step 起补发该步内事件）**，避免漏掉 `command_output` 等同 step 多事件。传参时请与事件体中的 `eventSeq` 对齐。
+
+连接校验失败时（在推送过程事件前）：
+- 无 session cookie：推送 `{ "type": "task_status", "status": "failed", "error": "Missing session cookie" }` 后关闭
+- conversation 不存在或不属于当前 session：推送 `{ "type": "task_status", "status": "failed", "error": "Conversation not found" }` 后关闭
 
 消息推送：
-- 过程事件（结构与任务接口保持一致，来自 `AgentEvent`）：
+- 过程事件（结构与任务接口类似，额外带序列号）：
   - `stepId`：int
   - `type`：`"round_start" | "llm_response" | "tool_call" | "tool_result" | "finished" | "command_start" | "command_output" | "command_end" | "expo_url_ready"`
   - `title`：string
   - `detail`：string 或 `null`
+  - `eventSeq`：number 或 `null`（数据库中的同 step 内序号；旧数据可能为 `null`）
 
-- 结束消息（当 run 已完成且没有新事件时）：
+- 结束消息（当 run 已完成且本轮没有新事件时）：
   - `type`：`"task_status"`
   - `status`：`"completed"` 或 `"failed"`
   - `error`：string 或 `null`
-  - `expoUrl`：string 或 `null`（当 `status="completed"` 时提供给前端“查看应用”按钮的跳转链接）
+  - `expoUrl`：string 或 `null`（当 `status="completed"` 时提供给前端「查看应用」的链接）
+
+- 若 run 与 URL 中的 `conversationId` 不一致：推送 `task_status`/`failed`/`Run does not belong to conversation` 后关闭。
 
 断开：
 - 客户端主动断开时，服务端结束该连接的处理循环。
 
+---
+
+## 全局错误处理
+
+未捕获的服务端异常会由 `main.py` 的异常处理器统一返回 **500**：
+- `{ "error": "Internal Server Error" }`
+
+（具体异常会打印到服务端控制台，响应中不暴露内部细节。）

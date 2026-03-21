@@ -15,7 +15,7 @@ _progress_logger = logging.getLogger("agent.progress")
 
 
 def _log_event(task_id: str, event: AgentEvent) -> None:
-    """将事件以可读形式打到后端 logger，便于在控制台实时查看进度。"""
+    """将事件以可读形式打到后端 logger，便于在控制台与日志文件中查看进度。"""
     tid = f"[{task_id[:8]}]" if task_id else ""
     if event.type == "command_start":
         _progress_logger.info("%s $ %s", tid, event.detail or "")
@@ -36,6 +36,27 @@ def _log_event(task_id: str, event: AgentEvent) -> None:
         _progress_logger.info("%s %s", tid, event.title)
     elif event.type == "finished":
         _progress_logger.info("%s %s", tid, event.title)
+    elif event.type == "expo_url_ready":
+        # 对话模式下「查看应用」通知：把 exp:// 一并记入进度日志，便于事后排查
+        _progress_logger.info("%s %s %s", tid, event.title, event.detail or "")
+
+
+def emit_progress_log(task_id: str | None, event: AgentEvent) -> None:
+    """把单条 Agent 事件写入 agent.progress 日志文件并 flush，尽量接近实时落盘。
+
+    与 ``TaskManager.append_event`` 的区别：
+    - 本函数**只写日志**，不维护内存中的任务时间线（供无 task_id 或对话 run_id 等场景使用）；
+    - ``append_event`` 会先更新任务状态再调用相同的底层格式化逻辑（通过本函数）以免重复代码。
+
+    说明：在 ``append_event`` 中应调用本函数而不是直接调用 ``_log_event``，以便统一 flush 行为。
+    """
+    _log_event(task_id or "", event)
+    for handler in _progress_logger.handlers:
+        try:
+            handler.flush()
+        except (OSError, ValueError):
+            # 日志句柄已关闭或不可写时忽略，避免影响主流程
+            pass
 
 
 @dataclass
@@ -98,8 +119,8 @@ class TaskManager:
                 state = TaskState(task_id=task_id)
                 self._tasks[task_id] = state
             state.events.append(event)
-        # 在锁外打日志，避免 I/O 阻塞
-        _log_event(task_id, event)
+        # 在锁外写进度日志并 flush，避免长时间阻塞锁；与对话模式共用同一套落盘逻辑
+        emit_progress_log(task_id, event)
 
     def finish_task(self, task_id: str, result: "TaskResult") -> None:
         with self._lock:
